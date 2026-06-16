@@ -88,6 +88,10 @@ const OptionInfoRec AMDGPUOptions_KMS[] = {
 	{OPTION_DELETE_DP12, "DeleteUnusedDP12Displays", OPTV_BOOLEAN, {0}, FALSE},
 	{OPTION_VARIABLE_REFRESH, "VariableRefresh", OPTV_BOOLEAN, {0}, FALSE },
 	{OPTION_ASYNC_FLIP_SECONDARIES, "AsyncFlipSecondaries", OPTV_BOOLEAN, {0}, FALSE},
+	{OPTION_CLOCK_REDUCTION_GPUS, "ClockReductionGpus", OPTV_STRING, {0}, FALSE},
+	{OPTION_CLOCK_REDUCTION_CLOCKS, "ClockReductionClocks", OPTV_STRING, {0}, FALSE},
+	{OPTION_CLOCK_REDUCTION_AMOUNT, "ClockReductionAmount", OPTV_INTEGER, {0}, FALSE},
+	{OPTION_CLOCK_REDUCTION_INTERNAL, "ClockReductionInternal", OPTV_BOOLEAN, {0}, FALSE},
 	{-1, NULL, OPTV_NONE, {0}, FALSE}
 };
 
@@ -1545,6 +1549,19 @@ void AMDGPUWindowExposures_oneshot(WindowPtr pWin, RegionPtr pRegion
 	drmmode_set_desired_modes(pScrn, &info->drmmode, TRUE);
 }
 
+/* ClockReduction prototypes (definitions follow after CloseScreen) */
+#define CLOCK_REDUCTION_DEFAULT_AMOUNT 100
+#define CLOCK_REDUCTION_MAX_AMOUNT     1000
+#define CLOCK_REDUCTION_MIN_CLOCK      150000
+
+static void amdgpu_init_clock_reduction(clock_reduction_config_t *cfg);
+static void amdgpu_free_clock_reduction(clock_reduction_config_t *cfg);
+static void amdgpu_parse_clock_reduction_int_list(ScrnInfoPtr pScrn,
+	int **list, int *count,
+	const char *option_value, const char *desc);
+static void amdgpu_parse_clock_reduction_amount(ScrnInfoPtr pScrn,
+	clock_reduction_config_t *cfg, int amount);
+
 Bool AMDGPUPreInit_KMS(ScrnInfoPtr pScrn, int flags)
 {
 	AMDGPUInfoPtr info;
@@ -1741,6 +1758,26 @@ Bool AMDGPUPreInit_KMS(ScrnInfoPtr pScrn, int flags)
 		xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "No modes.\n");
 		return FALSE;
 	}
+
+	amdgpu_init_clock_reduction(&info->clock_reduction);
+	amdgpu_parse_clock_reduction_int_list(pScrn,
+			&info->clock_reduction.gpu_ids,
+			&info->clock_reduction.gpu_count,
+			xf86GetOptValString(info->Options, OPTION_CLOCK_REDUCTION_GPUS),
+			"GPUs");
+	amdgpu_parse_clock_reduction_int_list(pScrn,
+			&info->clock_reduction.clocks,
+			&info->clock_reduction.clock_count,
+			xf86GetOptValString(info->Options, OPTION_CLOCK_REDUCTION_CLOCKS),
+			"Clocks");
+	{
+		int amount = CLOCK_REDUCTION_DEFAULT_AMOUNT;
+		xf86GetOptValInteger(info->Options, OPTION_CLOCK_REDUCTION_AMOUNT, &amount);
+		amdgpu_parse_clock_reduction_amount(pScrn, &info->clock_reduction, amount);
+	}
+
+	info->clock_reduction.use_internal =
+		xf86ReturnOptValBool(info->Options, OPTION_CLOCK_REDUCTION_INTERNAL, TRUE);
 
 	return TRUE;
 }
@@ -1957,11 +1994,116 @@ static Bool AMDGPUCloseScreen_KMS(ScreenPtr pScreen)
 	return pScreen->CloseScreen(pScreen);
 }
 
+/* ClockReduction helpers (definitions) */
+
+static void amdgpu_init_clock_reduction(clock_reduction_config_t *cfg)
+{
+	cfg->gpu_ids = NULL;
+	cfg->gpu_count = 0;
+	cfg->clocks = NULL;
+	cfg->clock_count = 0;
+	cfg->reduction_khz = 0;
+	cfg->use_internal = FALSE;
+}
+
+static void amdgpu_free_clock_reduction(clock_reduction_config_t *cfg)
+{
+	free(cfg->gpu_ids);
+	cfg->gpu_ids = NULL;
+	cfg->gpu_count = 0;
+	free(cfg->clocks);
+	cfg->clocks = NULL;
+	cfg->clock_count = 0;
+	cfg->reduction_khz = 0;
+	cfg->use_internal = FALSE;
+}
+
+static void amdgpu_parse_clock_reduction_int_list(ScrnInfoPtr pScrn,
+						  int **list, int *count,
+						  const char *option_value,
+						  const char *desc)
+{
+	const char *p;
+	int n, i;
+
+	if (!option_value || !*option_value)
+		return;
+
+	p = option_value;
+	n = 0;
+	while (*p) {
+		char *endptr;
+
+		strtol(p, &endptr, 0);
+		if (endptr == p) {
+			xf86DrvMsgVerb(pScrn->scrnIndex, X_WARNING,
+				       AMDGPU_LOGLEVEL_DEBUG,
+				       "ClockReduction %s: invalid value\n",
+				       desc);
+			return;
+		}
+		n++;
+		p = endptr;
+
+		if (*p == ',') {
+			p++;
+		} else if (*p != '\0') {
+			xf86DrvMsgVerb(pScrn->scrnIndex, X_WARNING,
+				       AMDGPU_LOGLEVEL_DEBUG,
+				       "ClockReduction %s: expected ',' or "
+				       "end, got '%c'\n", desc, *p);
+			return;
+		}
+	}
+
+	*list = calloc(n, sizeof(int));
+	if (!*list) {
+		xf86DrvMsgVerb(pScrn->scrnIndex, X_ERROR, AMDGPU_LOGLEVEL_DEBUG,
+			       "Failed to allocate memory for %s\n", desc);
+		return;
+	}
+
+	p = option_value;
+	for (i = 0; i < n; i++) {
+		char *endptr;
+		(*list)[i] = strtol(p, &endptr, 0);
+		p = endptr;
+		if (*p == ',') p++;
+	}
+
+	*count = n;
+	xf86DrvMsgVerb(pScrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
+		       "ClockReduction %s: loaded %d entries\n", desc, *count);
+}
+
+static void amdgpu_parse_clock_reduction_amount(ScrnInfoPtr pScrn,
+						clock_reduction_config_t *cfg,
+						int amount)
+{
+	if (amount <= 0) {
+		cfg->reduction_khz = 0;
+		xf86DrvMsgVerb(pScrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
+					   "ClockReductionAmount: set to 0\n");
+	} else if (amount > CLOCK_REDUCTION_MAX_AMOUNT) {
+		cfg->reduction_khz = CLOCK_REDUCTION_MAX_AMOUNT;
+		xf86DrvMsgVerb(pScrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
+					   "ClockReductionAmount: clamped to max %d kHz\n",
+					   CLOCK_REDUCTION_MAX_AMOUNT);
+	} else {
+		cfg->reduction_khz = amount;
+		xf86DrvMsgVerb(pScrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
+					   "ClockReductionAmount: set to %d kHz\n", amount);
+	}
+}
+
 void AMDGPUFreeScreen_KMS(ScrnInfoPtr pScrn)
 {
+	AMDGPUInfoPtr info = AMDGPUPTR(pScrn);
+
 	xf86DrvMsgVerb(pScrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
 		       "AMDGPUFreeScreen\n");
 
+	amdgpu_free_clock_reduction(&info->clock_reduction);
 	AMDGPUFreeRec(pScrn);
 }
 

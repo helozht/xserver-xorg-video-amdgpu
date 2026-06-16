@@ -166,6 +166,10 @@ typedef enum {
 	OPTION_DELETE_DP12,
 	OPTION_VARIABLE_REFRESH,
 	OPTION_ASYNC_FLIP_SECONDARIES,
+	OPTION_CLOCK_REDUCTION_GPUS,
+	OPTION_CLOCK_REDUCTION_CLOCKS,
+	OPTION_CLOCK_REDUCTION_AMOUNT,
+	OPTION_CLOCK_REDUCTION_INTERNAL,
 } AMDGPUOpts;
 
 static inline ScreenPtr
@@ -246,6 +250,22 @@ struct amdgpu_window_priv {
 };
 
 extern DevScreenPrivateKeyRec amdgpu_device_private_key;
+
+/* ClockReduction: two separate match tables - GPU list and clock list. */
+/* For any GPU in the GPU list, all clocks in the clock list are reduced.  */
+/* xorg.conf options:                                                       */
+/*   Option "ClockReductionGpus"   "0x6611,0x1234"  (or "*" for any GPU)   */
+/*   Option "ClockReductionClocks" "285540,235660"  (or "*" for any clock) */
+/*   Option "ClockReductionAmount" "100"             (1-1000 kHz)           */
+/*   Option "ClockReductionInternal" "off"           (on/off, default on)   */
+typedef struct {
+	int *gpu_ids;
+	int gpu_count;
+	int *clocks;
+	int clock_count;
+	int reduction_khz;
+	Bool use_internal;
+} clock_reduction_config_t;
 
 typedef struct {
 	EntityInfoPtr pEnt;
@@ -345,6 +365,9 @@ typedef struct {
 	} glamor;
 
 	xf86CrtcFuncsRec drmmode_crtc_funcs;
+
+	/* ClockReduction configuration */
+	clock_reduction_config_t clock_reduction;
 } AMDGPUInfoRec, *AMDGPUInfoPtr;
 
 

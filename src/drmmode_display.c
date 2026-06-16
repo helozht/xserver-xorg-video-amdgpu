@@ -1240,6 +1240,108 @@ drmmode_crtc_gamma_do_set(xf86CrtcPtr crtc, uint16_t *red, uint16_t *green,
 			   ret);
 }
 
+/*
+ * Internal quirk tables for transparent clock reduction.
+ * GPU list and clock list are independent: if the GPU matches, then every
+ * clock in the clock list gets reduced by the configured amount.
+ * Clock reduction happens at modeset time, modifying only kmode.clock
+ * before drmModeSetCrtc.  xrandr still shows the original EDID clock.
+ * Add entries to these arrays as needed.
+ */
+static const int clock_reduction_gpus[] = {
+	0x6611,
+};
+
+static const int clock_reduction_clocks[] = {
+	185590,
+	229840,
+	235660,
+	285540,
+};
+
+#define CLOCK_REDUCTION_MAX_AMOUNT     1000
+#define CLOCK_REDUCTION_MIN_CLOCK      150000
+
+static Bool is_clock_reduction_gpu(const int *gpus, int count, int device_id)
+{
+	int i;
+	for (i = 0; i < count; i++) {
+		if (gpus[i] == device_id)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static Bool is_clock_reduction_clock(const int *clocks, int count, int clock)
+{
+	int i;
+	for (i = 0; i < count; i++) {
+		if (clocks[i] == clock)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static void apply_clock_reduction_kmode(ScrnInfoPtr scrn,
+					struct pci_device *dev,
+					AMDGPUInfoPtr info,
+					drmModeModeInfo *kmode,
+					int original_clock)
+{
+	Bool gpu_match_internal, gpu_match_config;
+	Bool clock_match;
+	int reduction, new_clock;
+
+	if (!scrn || !dev || !info || !kmode)
+		return;
+
+	reduction = info->clock_reduction.reduction_khz;
+	if (reduction == 0)
+		return;
+	if (reduction > CLOCK_REDUCTION_MAX_AMOUNT)
+		reduction = CLOCK_REDUCTION_MAX_AMOUNT;
+
+	gpu_match_internal = info->clock_reduction.use_internal
+			     && (sizeof(clock_reduction_gpus) / sizeof(clock_reduction_gpus[0]) > 0)
+			     && is_clock_reduction_gpu(clock_reduction_gpus,
+					sizeof(clock_reduction_gpus) / sizeof(clock_reduction_gpus[0]),
+					dev->device_id);
+
+	gpu_match_config = is_clock_reduction_gpu(info->clock_reduction.gpu_ids,
+					info->clock_reduction.gpu_count,
+					dev->device_id);
+
+	if (!gpu_match_internal && !gpu_match_config)
+		return;
+
+	clock_match = info->clock_reduction.use_internal
+		      && (sizeof(clock_reduction_clocks) / sizeof(clock_reduction_clocks[0]) > 0)
+		      && is_clock_reduction_clock(clock_reduction_clocks,
+				sizeof(clock_reduction_clocks) / sizeof(clock_reduction_clocks[0]),
+				original_clock);
+
+	clock_match = clock_match ||
+					is_clock_reduction_clock(info->clock_reduction.clocks,
+					info->clock_reduction.clock_count,
+					original_clock);
+
+	if (!clock_match)
+		return;
+
+	new_clock = original_clock - reduction;
+	if (new_clock < CLOCK_REDUCTION_MIN_CLOCK) {
+		xf86DrvMsgVerb(scrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
+			"ClockReduction: Skipped clock=%d (would go below %d kHz)\n",
+			original_clock, CLOCK_REDUCTION_MIN_CLOCK);
+		return;
+	}
+
+	kmode->clock = new_clock;
+	xf86DrvMsgVerb(scrn->scrnIndex, X_INFO, AMDGPU_LOGLEVEL_DEBUG,
+		"ClockReduction: Reduced clock %d -> %d kHz (gpu=0x%x)\n",
+		original_clock, new_clock, dev->device_id);
+}
+
 Bool
 drmmode_set_mode(xf86CrtcPtr crtc, struct drmmode_fb *fb, DisplayModePtr mode,
 		 int x, int y)
@@ -1269,6 +1371,13 @@ drmmode_set_mode(xf86CrtcPtr crtc, struct drmmode_fb *fb, DisplayModePtr mode,
 	}
 
 	drmmode_ConvertToKMode(scrn, &kmode, mode);
+
+	{
+		AMDGPUInfoPtr info = AMDGPUPTR(scrn);
+		struct pci_device *dev = pAMDGPUEnt->platform_dev ?
+			pAMDGPUEnt->platform_dev->pdev : NULL;
+		apply_clock_reduction_kmode(scrn, dev, info, &kmode, mode->Clock);
+	}
 
 	ret = drmModeSetCrtc(pAMDGPUEnt->fd,
 			     drmmode_crtc->mode_crtc->crtc_id,

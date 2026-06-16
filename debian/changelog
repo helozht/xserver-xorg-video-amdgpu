@@ -1,3 +1,9 @@
+xserver-xorg-video-amdgpu (23.0.0-1deepin1) unstable; urgency=medium
+
+  * feat: Add ClockReduction feature for modeset-time pixel clock adjustment
+
+ -- zhanghaotian <zhanghaotian@uniontech.com>  Wed, 17 Jun 2026 09:54:58 +0800
+
 xserver-xorg-video-amdgpu (23.0.0-1) unstable; urgency=medium
 
   * New upstream release. (Closes: #1031021)
